@@ -1157,7 +1157,7 @@ define KernelPackage/video-mem2mem
   SUBMENU:=$(VIDEO_MENU)
   TITLE:=Memory 2 Memory device support
   HIDDEN:=1
-  DEPENDS:=+kmod-video-videobuf2
+  DEPENDS:=@!TARGET_tegra_generic +kmod-video-videobuf2
   KCONFIG:= \
     CONFIG_V4L_MEM2MEM_DRIVERS=y \
     CONFIG_V4L2_MEM2MEM_DEV
@@ -1176,7 +1176,7 @@ define KernelPackage/video-dma
   SUBMENU:=$(VIDEO_MENU)
   TITLE:=Video DMA support
   HIDDEN:=1
-  DEPENDS:=+kmod-video-videobuf2
+  DEPENDS:=@!TARGET_tegra_generic +kmod-video-videobuf2
   KCONFIG:= \
 	CONFIG_VIDEOBUF2_DMA_CONTIG \
 	CONFIG_VIDEOBUF2_DMA_SG
