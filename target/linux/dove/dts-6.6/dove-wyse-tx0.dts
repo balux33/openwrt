@@ -74,8 +74,8 @@
 	status = "okay";
 
 	bus-width = <4>;
-	cd-gpios = <&gpio0 12 GPIO_ACTIVE_LOW>;
-	wp-gpios = <&gpio0 13 GPIO_ACTIVE_LOW>;
+	//cd-gpios = <&gpio0 12 GPIO_ACTIVE_LOW>;
+	//wp-gpios = <&gpio0 13 GPIO_ACTIVE_LOW>;
 };
 
 &spi0 {
