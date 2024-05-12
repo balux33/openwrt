@@ -7,7 +7,7 @@ dove_setup_interfaces()
 
 	case "$board" in
 	wyse,tx0)
-		ucidef_set_interface_lan "eth0"
+		ucidef_set_interface_lan "eth0" "dhcp"
 		;;
 	*)
 		ucidef_set_interfaces_lan_wan "eth0" "eth1"
