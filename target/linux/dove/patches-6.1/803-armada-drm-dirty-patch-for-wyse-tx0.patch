@@ -1,0 +1,229 @@
+From: balux33 <balux33@gmail.com>
+Subject: HACK: experimental patch to enable video output on wyse Tx0
+
+Use tfp410 brdige driver(in hv mode comaptible with sil164c) and dvi-connector driver from drm subsystem. 
+By default the armada drm driver is not bind to the tfp410 bridge. Maybe because it does not contain an encoder like TDA998x_drv.c? 
+So I added a simple encoder to the crtc code and removed the armada_add_endpoints() function. 
+Since there is currently no driver for the external IDT5V49EE503 clock generator, i use the internal video pll. 
+The disadvantage of this is that at certain resolutions the pixel clock can be significantly different from the desired one.
+Most monitors can tolerate this, but use it at your own risk! Use lower resolutions e.g. 1280x720, in which case the problem is less likely to occur. 
+With these modifications the video output will work properly. 
+Currently only works in DVI-D mode (there is no driver for the internal VGA DAC) 
+So far I tested with Framebuffer console and lib-drm modetest program. 
+
+Translated with DeepL.com (free version)
+
+based on Doug Brown <doug@schmorgal.com> work for chumby8 
+
+--- a/drivers/gpu/drm/armada/armada_510.c
++++ b/drivers/gpu/drm/armada/armada_510.c
+@@ -85,8 +85,9 @@ static const u32 armada510_clk_sels[] =
+ 
+ static const struct armada_clocking_params armada510_clocking = {
+ 	/* HDMI requires -0.6%..+0.5% */
+-	.permillage_min = 994,
+-	.permillage_max = 1005,
++	//use intenal pll with coarse resolution -> allow -20% -- +20% error
++	.permillage_min = 800,
++	.permillage_max = 1200,
+ 	.settable = BIT(0) | BIT(1),
+ 	.div_max = SCLK_510_INT_DIV_MASK,
+ };
+--- a/drivers/gpu/drm/armada/armada_crtc.c
++++ b/drivers/gpu/drm/armada/armada_crtc.c
+@@ -14,6 +14,8 @@
+ #include <drm/drm_atomic_helper.h>
+ #include <drm/drm_probe_helper.h>
+ #include <drm/drm_vblank.h>
++#include <drm/drm_bridge.h>
++#include <drm/drm_simple_kms_helper.h>
+ 
+ #include "armada_crtc.h"
+ #include "armada_drm.h"
+@@ -843,8 +845,8 @@ int armada_crtc_select_clock(struct arma
+ 	u32 div;
+ 	int i;
+ 
+-	DRM_DEBUG_KMS("[CRTC:%u:%s] desired clock=%luHz\n",
+-		      dcrtc->crtc.base.id, dcrtc->crtc.name, desired_hz);
++	printk(KERN_NOTICE "[CRTC:%u:%s] desired clock=%luHz\n",
++			  dcrtc->crtc.base.id, dcrtc->crtc.name, desired_hz);
+ 
+ 	for (i = 0; i < num_clks; i++) {
+ 		clk = clks[i];
+@@ -873,8 +875,8 @@ int armada_crtc_select_clock(struct arma
+ 
+ 		/* Calculate the actual rate - HDMI requires -0.6%..+0.5% */
+ 		real_hz = DIV_ROUND_CLOSEST(real_clk_hz, div);
+-
+-		DRM_DEBUG_KMS("[CRTC:%u:%s] clk=%u %luHz div=%u real=%luHz\n",
++			
++		printk(KERN_NOTICE "[CRTC:%u:%s] clk=%u %luHz div=%u real=%luHz\n",
+ 			dcrtc->crtc.base.id, dcrtc->crtc.name,
+ 			i, real_clk_hz, div, real_hz);
+ 
+@@ -912,6 +914,7 @@ static int armada_drm_crtc_create(struct
+ 	struct armada_private *priv = drm_to_armada_dev(drm);
+ 	struct armada_crtc *dcrtc;
+ 	struct drm_plane *primary;
++	struct drm_bridge *bridge;
+ 	void __iomem *base;
+ 	int ret;
+ 
+@@ -927,6 +930,28 @@ static int armada_drm_crtc_create(struct
+ 
+ 	if (dev != drm->dev)
+ 		dev_set_drvdata(dev, dcrtc);
++	
++	/* Create a simple encoder for this CRTC to use */
++	ret = drm_simple_encoder_init(drm, &dcrtc->encoder, DRM_MODE_ENCODER_NONE);
++	if (ret < 0) {
++		DRM_ERROR("failed to create Armada encoder\n");
++		goto err_crtc;
++	}
++	dcrtc->encoder.possible_crtcs = 0x1;
++
++	/* Find a bridge to connect */
++	bridge = devm_drm_of_get_bridge(dev, dev->of_node, 0, 0);
++	if (IS_ERR(bridge) && (PTR_ERR(bridge) != -ENODEV)) {
++		ret = PTR_ERR(bridge);
++		goto err_encoder;
++	}
++
++	/* Attach the bridge to the encoder */
++	ret = drm_bridge_attach(&dcrtc->encoder, bridge, NULL, 0);
++	if (ret < 0) {
++		DRM_ERROR("failed to attach Armada bridge\n");
++		goto err_encoder;
++	}
+ 
+ 	dcrtc->variant = variant;
+ 	dcrtc->base = base;
+@@ -953,12 +978,12 @@ static int armada_drm_crtc_create(struct
+ 	ret = devm_request_irq(dev, irq, armada_drm_irq, 0, "armada_drm_crtc",
+ 			       dcrtc);
+ 	if (ret < 0)
+-		goto err_crtc;
++		goto err_encoder;
+ 
+ 	if (dcrtc->variant->init) {
+ 		ret = dcrtc->variant->init(dcrtc, dev);
+ 		if (ret)
+-			goto err_crtc;
++			goto err_encoder;
+ 	}
+ 
+ 	/* Ensure AXI pipeline is enabled */
+@@ -971,13 +996,13 @@ static int armada_drm_crtc_create(struct
+ 	primary = kzalloc(sizeof(*primary), GFP_KERNEL);
+ 	if (!primary) {
+ 		ret = -ENOMEM;
+-		goto err_crtc;
++		goto err_encoder;
+ 	}
+ 
+ 	ret = armada_drm_primary_plane_init(drm, primary);
+ 	if (ret) {
+ 		kfree(primary);
+-		goto err_crtc;
++		goto err_encoder;
+ 	}
+ 
+ 	ret = drm_crtc_init_with_planes(drm, &dcrtc->crtc, primary, NULL,
+@@ -997,6 +1022,8 @@ static int armada_drm_crtc_create(struct
+ 
+ err_crtc_init:
+ 	primary->funcs->destroy(primary);
++err_encoder:
++	drm_encoder_cleanup(&dcrtc->encoder);
+ err_crtc:
+ 	kfree(dcrtc);
+ 
+@@ -1052,7 +1079,8 @@ static void
+ armada_lcd_unbind(struct device *dev, struct device *master, void *data)
+ {
+ 	struct armada_crtc *dcrtc = dev_get_drvdata(dev);
+-
++	
++	drm_encoder_cleanup(&dcrtc->encoder);
+ 	armada_drm_crtc_destroy(&dcrtc->crtc);
+ }
+ 
+--- a/drivers/gpu/drm/armada/armada_crtc.h
++++ b/drivers/gpu/drm/armada/armada_crtc.h
+@@ -6,6 +6,7 @@
+ #define ARMADA_CRTC_H
+ 
+ #include <drm/drm_crtc.h>
++#include <drm/drm_encoder.h>
+ 
+ struct armada_gem_object;
+ 
+@@ -35,6 +36,7 @@ struct armada_variant;
+ 
+ struct armada_crtc {
+ 	struct drm_crtc		crtc;
++	struct drm_encoder encoder;
+ 	const struct armada_variant *variant;
+ 	void			*variant_data;
+ 	unsigned		num;
+--- a/drivers/gpu/drm/armada/armada_drv.c
++++ b/drivers/gpu/drm/armada/armada_drv.c
+@@ -270,13 +270,14 @@ static int armada_drm_probe(struct platf
+ 
+ 			drm_of_component_match_add(dev, &match, component_compare_of, np);
+ 		}
+-
++/*
+ 		for_each_compatible_node(np, NULL, "marvell,armada-lcdc") {
+ 			if (!of_device_is_available(np))
+ 				continue;
+ 
+ 			armada_add_endpoints(dev, &match, np);
+ 		}
++*/
+ 	}
+ 
+ 	return component_master_add_with_match(&pdev->dev, &armada_master_ops,
+--- a/drivers/gpu/drm/armada/armada_fb.c
++++ b/drivers/gpu/drm/armada/armada_fb.c
+@@ -4,7 +4,6 @@
+  */
+ 
+ #include <drm/drm_modeset_helper.h>
+-#include <drm/drm_fb_helper.h>
+ #include <drm/drm_fourcc.h>
+ #include <drm/drm_gem_framebuffer_helper.h>
+ 
+@@ -21,9 +20,10 @@ static const struct drm_framebuffer_func
+ struct armada_framebuffer *armada_framebuffer_create(struct drm_device *dev,
+ 	const struct drm_mode_fb_cmd2 *mode, struct armada_gem_object *obj)
+ {
++	const struct drm_format_info *info = drm_get_format_info(dev, mode);
+ 	struct armada_framebuffer *dfb;
+ 	uint8_t format, config;
+-	int ret;
++	int ret, i;
+ 
+ 	switch (mode->pixel_format) {
+ #define FMT(drm, fmt, mod)		\
+@@ -63,7 +63,8 @@ struct armada_framebuffer *armada_frameb
+ 
+ 	dfb->fmt = format;
+ 	dfb->mod = config;
+-	dfb->fb.obj[0] = &obj->obj;
++	for (i = 0; i < info->num_planes; i++)
++		dfb->fb.obj[i] = &obj->obj;
+ 
+ 	drm_helper_mode_fill_fb_struct(dev, &dfb->fb, mode);
+ 
+@@ -79,7 +80,8 @@ struct armada_framebuffer *armada_frameb
+ 	 * the above call, but the caller will drop their reference
+ 	 * to it.  Hence we need to take our own reference.
+ 	 */
+-	drm_gem_object_get(&obj->obj);
++	for (i = 0; i < info->num_planes; i++)
++		drm_gem_object_get(&obj->obj);
+ 
+ 	return dfb;
+ }
