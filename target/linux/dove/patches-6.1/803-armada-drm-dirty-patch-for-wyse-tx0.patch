@@ -11,8 +11,6 @@ With these modifications the video output will work properly.
 Currently only works in DVI-D mode (there is no driver for the internal VGA DAC) 
 So far I tested with Framebuffer console and lib-drm modetest program. 
 
-Translated with DeepL.com (free version)
-
 based on Doug Brown <doug@schmorgal.com> work for chumby8 
 
 --- a/drivers/gpu/drm/armada/armada_510.c
