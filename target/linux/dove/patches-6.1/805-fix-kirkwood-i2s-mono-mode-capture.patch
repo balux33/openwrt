@@ -1,0 +1,21 @@
+From: balux33 <balux33@gmail.com>
+Subject: fix kirkwood-i2s capture if channels == 1 (mono mode)
+
+if mono mode enabled use only Left channel.
+
+--- a/sound/soc/kirkwood/kirkwood-i2s.c
++++ b/sound/soc/kirkwood/kirkwood-i2s.c
+@@ -206,8 +206,12 @@ static int kirkwood_i2s_hw_params(struct
+ 				    KIRKWOOD_PLAYCTL_SIZE_MASK);
+ 		priv->ctl_play |= ctl_play;
+ 	} else {
++		if (params_channels(params) == 1) //mono recording
++			ctl_rec |= KIRKWOOD_RECCTL_MONO | KIRKWOOD_RECCTL_MONO_CHAN_LEFT;  //select left channel
+ 		priv->ctl_rec &= ~(KIRKWOOD_RECCTL_ENABLE_MASK |
+-				   KIRKWOOD_RECCTL_SIZE_MASK);
++				   KIRKWOOD_RECCTL_SIZE_MASK |
++				   KIRKWOOD_RECCTL_MONO |  //use as mask 
++				   KIRKWOOD_RECCTL_MONO_CHAN_RIGHT); //use as mask
+ 		priv->ctl_rec |= ctl_rec;
+ 	}
+ 
