@@ -84,6 +84,39 @@
 			};
 		};
 	};
+
+	spdif_out: spdif-out {
+		  #sound-dai-cells = <0>;
+	      compatible = "linux,spdif-dit";
+	};
+	
+	sound {
+		compatible = "simple-audio-card";
+		simple-audio-card,name = "Wyse_Tx0_Audio";
+		simple-audio-card,mclk-fs = <256>;
+ 	
+		simple-audio-card,dai-link@0 {		// I2S - RT5630
+			reg = <0>;
+			format = "i2s";
+			cpu {
+				sound-dai = <&audio1 0>;
+			};
+			codec {
+				sound-dai = <&rt5630>;
+			};
+		};
+
+		simple-audio-card,dai-link@1 {		// S/PDIF (line out combo jack)
+			reg = <1>;
+			format = "i2s";
+			cpu {
+				sound-dai = <&audio1 1>;
+			};
+			codec {
+				sound-dai = <&spdif_out>;
+			};
+		};
+	};	
 };
 
 &eth { status = "okay"; };
@@ -96,6 +129,14 @@
 	pinctrl-0 = <&pmx_i2c1>;
 	pinctrl-names = "default";
 	clock-frequency = <100000>;
+};
+
+&i2c0 {
+	rt5630: rt5630@1f {
+			compatible = "realtek,rt5630";
+			reg = <0x1f>;
+			#sound-dai-cells = <0>;
+	};
 };
 
 &i2c1 {
@@ -151,3 +192,12 @@
 };
 
 &uart0 { status = "okay"; };
+
+&audio1 {
+	status = "okay";
+	#sound-dai-cells = <1>;
+	clocks = <&gate_clk 13>;
+	clock-names = "internal";
+	pinctrl-0 = <&pmx_audio1_i2s1_spdifo>;
+	pinctrl-names = "default";
+};
