@@ -1,0 +1,1434 @@
+From: balux33 <balux33@gmail.com>
+Subject: Add RT5630 codec driver for wyse Tx0
+
+Based on the rt5630.c driver in the old ubuntu kernel. 
+Supported sample rates: 44.1k, 48k
+
+Supported outputs:  (Automatic switching is not implemented)
+stereo headphone thr. hp combo jack (controls: volume, mute(default enabled))
+internal speaker (controls volume, mute(default muted) 
+spdif out thr. hp combo jack (not tested)
+
+Supported inputs:  
+mono or stereo microphone thr. mic jack (controls mic boost, ADC_gain)
+
+--- a/sound/soc/codecs/Kconfig
++++ b/sound/soc/codecs/Kconfig
+@@ -184,6 +184,7 @@ config SND_SOC_ALL_CODECS
+ 	imply SND_SOC_RT5651
+ 	imply SND_SOC_RT5659
+ 	imply SND_SOC_RT5660
++	imply SND_SOC_RT5630
+ 	imply SND_SOC_RT5663
+ 	imply SND_SOC_RT5665
+ 	imply SND_SOC_RT5668
+@@ -1356,6 +1357,10 @@ config SND_SOC_RT5659
+ config SND_SOC_RT5660
+ 	tristate
+ 	depends on I2C
++	
++config SND_SOC_RT5630
++	tristate "Realtek RT5630 CODEC"
++	depends on I2C && SND_KIRKWOOD_SOC
+ 
+ config SND_SOC_RT5663
+ 	tristate
+--- a/sound/soc/codecs/Makefile
++++ b/sound/soc/codecs/Makefile
+@@ -209,6 +209,7 @@ snd-soc-rt5645-objs := rt5645.o
+ snd-soc-rt5651-objs := rt5651.o
+ snd-soc-rt5659-objs := rt5659.o
+ snd-soc-rt5660-objs := rt5660.o
++snd-soc-rt5630-objs := rt5630.o
+ snd-soc-rt5663-objs := rt5663.o
+ snd-soc-rt5665-objs := rt5665.o
+ snd-soc-rt5668-objs := rt5668.o
+@@ -566,6 +567,7 @@ obj-$(CONFIG_SND_SOC_RT5645)	+= snd-soc-
+ obj-$(CONFIG_SND_SOC_RT5651)	+= snd-soc-rt5651.o
+ obj-$(CONFIG_SND_SOC_RT5659)	+= snd-soc-rt5659.o
+ obj-$(CONFIG_SND_SOC_RT5660)	+= snd-soc-rt5660.o
++obj-$(CONFIG_SND_SOC_RT5630)	+= snd-soc-rt5630.o
+ obj-$(CONFIG_SND_SOC_RT5663)	+= snd-soc-rt5663.o
+ obj-$(CONFIG_SND_SOC_RT5665)	+= snd-soc-rt5665.o
+ obj-$(CONFIG_SND_SOC_RT5668)	+= snd-soc-rt5668.o
+--- /dev/null
++++ b/sound/soc/codecs/rt5630.c
+@@ -0,0 +1,704 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * rt5630.c  --  rt5630 ALSA Soc Audio driver
++ *
++ * Based on old rt5630 driver from wyse ubuntu kernel (no license information)
++ */
++ 
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/delay.h>
++#include <linux/pm.h>
++#include <linux/i2c.h>
++#include <linux/regmap.h>
++#include <linux/slab.h>
++#include <linux/of.h>
++#include <sound/core.h>
++#include <sound/pcm.h>
++#include <sound/pcm_params.h>
++#include <sound/tlv.h>
++#include <sound/soc.h>
++#include <sound/initval.h>
++
++#include "rt5630.h"
++
++static const char *rt5630_spk_out_sel[] = {"Class AB", "Class D"}; 					/*1*/
++static const char *rt5630_spk_l_source_sel[] = {"LPRN", "LPRP", "LPLN", "MM"};		/*2*/	
++static const char *rt5630_spkmux_source_sel[] = {"VMID", "HP Mixer", "SPK Mixer", "Mono Mixer"};               					/*3*/
++static const char *rt5630_hplmux_source_sel[] = {"VMID","HPL Mixer"};				/*4*/
++static const char *rt5630_hprmux_source_sel[] = {"VMID","HPR Mixer"};				/*5*/
++static const char *rt5630_spkamp_ratio_sel[] = {"2.25 Vdd", "2.00 Vdd", "1.75 Vdd", "1.50 Vdd", "1.25 Vdd", "1.00 Vdd"};				/*6*/
++static const char *rt5630_mic1_boost_sel[] = {"Bypass", "+20db", "+30db", "+40db"};	/*7*/
++
++
++static const struct soc_enum rt5630_enum[] = 
++{
++	SOC_ENUM_SINGLE(RT5630_OUTPUT_MIXER_CTRL, 13, 2, rt5630_spk_out_sel),		/*1*/
++	SOC_ENUM_SINGLE(RT5630_OUTPUT_MIXER_CTRL, 14, 4, rt5630_spk_l_source_sel),	/*2*/
++	SOC_ENUM_SINGLE(RT5630_OUTPUT_MIXER_CTRL, 10, 4, rt5630_spkmux_source_sel),/*3*/
++	SOC_ENUM_SINGLE(RT5630_OUTPUT_MIXER_CTRL, 9, 2, rt5630_hplmux_source_sel),	/*4*/
++	SOC_ENUM_SINGLE(RT5630_OUTPUT_MIXER_CTRL, 8, 2, rt5630_hprmux_source_sel),/*5*/
++	SOC_ENUM_SINGLE(RT5630_GEN_CTRL_REG1, 1, 6, rt5630_spkamp_ratio_sel),		/*6*/
++	SOC_ENUM_SINGLE(RT5630_MIC_CTRL, 10, 4,  rt5630_mic1_boost_sel),			/*7*/
++};
++
++static const struct snd_kcontrol_new rt5630_snd_controls[] = 
++{
++	SOC_ENUM("SPK_amp_type Playback Switch", rt5630_enum[0]),
++	//SOC_ENUM("Left SPK Source", rt5630_enum[1]),
++	//SOC_ENUM("SPK Amp Ratio", rt5630_enum[5]),
++	SOC_ENUM("Mic_boost Capture Switch", rt5630_enum[6]),
++	//SOC_ENUM("Speaker mux? Source", rt5630_enum[2]),  
++	SOC_DOUBLE("ADC_GAIN Capture Volume", RT5630_ADC_REC_GAIN, 8, 0, 31, 0),
++	SOC_SINGLE("SPKOUT_L Playback Volume", RT5630_SPK_OUT_VOL, 8, 31, 1),
++	//SOC_SINGLE("SPKOUT_R Playback Volume", RT5630_SPK_OUT_VOL, 0, 31, 1),
++	SOC_DOUBLE("SPKOUT Playback Switch", RT5630_SPK_OUT_VOL, 15, 7, 1, 1),
++	//SOC_SINGLE("HPOUT_L Playback Volume", RT5630_HP_OUT_VOL, 8, 31, 1),
++	//SOC_SINGLE("HPOUT_R Playback Volume", RT5630_HP_OUT_VOL, 0, 31, 1),
++	SOC_DOUBLE("HPOUT Playback Volume", RT5630_HP_OUT_VOL, 8, 0, 31, 1),
++	SOC_DOUBLE("HPOUT Playback Switch", RT5630_HP_OUT_VOL, 15, 7, 1, 1),
++};
++
++
++struct rt5630_init_reg {
++	char name[26];
++	u16 reg_value;
++	u8 reg_index;
++};
++
++static struct rt5630_init_reg rt5630_init_list[] = {
++	{"HP Output Volume", 0x1010, RT5630_HP_OUT_VOL},  //default unmuted mid vol
++	{"SPK Output Volume", 0x8080, RT5630_SPK_OUT_VOL}, // default muted max vol
++	{"DAC Mic Route", 0xee01, RT5630_DAC_AND_MIC_CTRL},  // DAC->HP mixer DAC -> spk_mixer
++	{"Output Mixer Control", 0x8b08, RT5630_OUTPUT_MIXER_CTRL},  // 0x0748 HP volume output from   hp mixer spk volume output from spk mixer class AB SPK_out_N LPLN (BTL mode)
++	{"Mic Control", 0x0500, RT5630_MIC_CTRL},       // mic1 +20db boost default
++	{"ADC Rec Mixer", 0x3f3f, RT5630_ADC_REC_MIXER},  //undocumented
++	{"General Control", 0x0c06, RT5630_GEN_CTRL_REG1},  // DAC HP enabled?? spk_amp vmid 1.50 Vdd
++	{"PCM Capture Volume",0xdfdf, RT5630_ADC_REC_GAIN}, // +30db gain ?
++};
++
++
++
++/* codec private data */
++struct rt5630_priv {
++	struct regmap *regmap;
++	u8 id;
++	unsigned int sysclk;
++};
++
++enum pll_sel
++{
++	RT5630_PLL1_FROM_MCLK = 0,
++	RT5630_PLL1_FROM_BCLK,
++	RT5630_PLL1_FROM_VBCLK,
++	RT5630_PLL2_FROM_VBCLK
++};
++
++struct _pll_div{
++	u32 pll_in;
++	u32 pll_out;
++	u16 regvalue;
++};
++
++static const struct _pll_div codec_master_pll1_div[] = {
++		
++	{  2048000,  24576000,	0x2ea0},
++	{  3686400,  24576000,	0xee27},	
++	{ 11289600,  22579200,	0x06a0},	
++	{ 12000000,  24576000,	0x2915},   
++	{ 12288000,  24576000,  0x06a0},  
++	{ 13000000,  24576000,	0x772e},
++	{ 13100000,	 24576000,	0x0d20},	
++};
++
++static const struct _pll_div codec_bclk_pll1_div[] = {
++
++	{  1536000,	 24576000,	0x3ea0},	
++	{  3072000,	 24576000,	0x1ea0},
++};
++
++static const struct _pll_div codec_vbclk_pll1_div[] = {
++
++	{  1536000,	 24576000,	0x3ea0},	
++	{  3072000,	 24576000,	0x1ea0},
++};
++
++
++int rt5630_codec_set_pll1(struct snd_soc_component *component, int pll_id, 
++		unsigned int freq_in, unsigned  int freq_out)
++{
++	int i;
++	int ret = -EINVAL;
++	
++
++	if (pll_id < RT5630_PLL1_FROM_MCLK || pll_id > RT5630_PLL1_FROM_VBCLK)
++		return -EINVAL;
++
++	if (!freq_in || !freq_out)
++		return 0;
++
++	if (RT5630_PLL1_FROM_MCLK == pll_id)
++	{
++		for (i = 0; i < ARRAY_SIZE(codec_master_pll1_div); i ++)
++		{
++			if ((freq_in == codec_master_pll1_div[i].pll_in) && (freq_out == codec_master_pll1_div[i].pll_out))
++			{
++				snd_soc_component_write(component, RT5630_GEN_CTRL_REG2, 0x0000);                    			 /*PLL source from MCLK*/
++				snd_soc_component_write(component, RT5630_PLL_CTRL, codec_master_pll1_div[i].regvalue);   /*set pll code*/
++				snd_soc_component_update_bits(component, RT5630_PWR_MANAG_ADD2, 0x8000, 0x8000);			/*enable pll1 power*/
++				ret = 0;
++			}
++		}
++	}
++	else if (RT5630_PLL1_FROM_BCLK == pll_id)
++	{
++		for (i = 0; i < ARRAY_SIZE(codec_bclk_pll1_div); i ++)
++		{
++			if ((freq_in == codec_bclk_pll1_div[i].pll_in) && (freq_out == codec_bclk_pll1_div[i].pll_out))
++			{
++				snd_soc_component_write(component, RT5630_GEN_CTRL_REG2, 0x2000);    					/*PLL source from BCLK*/
++				snd_soc_component_write(component, RT5630_PLL_CTRL, codec_bclk_pll1_div[i].regvalue);   /*set pll1 code*/
++				snd_soc_component_update_bits(component, RT5630_PWR_MANAG_ADD2, 0x8000, 0x8000);       	 /*enable pll1 power*/
++				ret = 0;
++			}
++		}
++	}
++	else if (RT5630_PLL1_FROM_VBCLK == pll_id)
++	{
++		for (i = 0; i < ARRAY_SIZE(codec_vbclk_pll1_div); i ++)
++		{
++			if ((freq_in == codec_vbclk_pll1_div[i].pll_in) && (freq_out == codec_vbclk_pll1_div[i].pll_out))
++			{
++				snd_soc_component_write(component, RT5630_GEN_CTRL_REG2, 0x2000);    					/*PLL source from BCLK*/
++				snd_soc_component_write(component, RT5630_PLL_CTRL, codec_vbclk_pll1_div[i].regvalue);   /*set pll1 code*/
++				snd_soc_component_update_bits(component, RT5630_PWR_MANAG_ADD2, 0x8000, 0x8000);       	 /*enable pll1 power*/
++				ret = 0;
++			}
++		}
++	}
++	
++	snd_soc_component_update_bits(component, RT5630_GEN_CTRL_REG1, 0x8000, 0x8000);
++	return ret;
++}
++
++
++static int rt5630_codec_set_pll2(struct snd_soc_component *component, int times)
++{
++	int iface = 0;
++	
++	snd_soc_component_update_bits(component, 0x3c, 0x4000, 0x4000);             //power on pll2
++
++	switch (times)
++	{
++		case 8:
++			break;	
++		case 16:
++			iface |= 0x0001;
++		break;
++		default:
++			return -EINVAL;
++	}
++	iface |= 0x8000;
++	snd_soc_component_write(component, 0x46, iface);
++
++	return 0;
++}
++
++
++	
++static int rt5630_codec_set_dai_pll(struct snd_soc_dai *codec_dai, 
++		int pll_id, int source, unsigned int freq_in, unsigned int freq_out)
++{
++	struct snd_soc_component *component = codec_dai->component;
++	int times;
++	times = freq_out / freq_in;
++
++	if (pll_id < RT5630_PLL2_FROM_VBCLK)
++		return rt5630_codec_set_pll1(component, pll_id, freq_in, freq_out);
++	else
++		return rt5630_codec_set_pll2(component, times);
++}
++
++
++
++/*
++ * Clock after PLL and dividers
++ */
++static int rt5630_set_dai_sysclk(struct snd_soc_dai *codec_dai,
++		int clk_id, unsigned int freq, int dir)
++{
++	struct snd_soc_component *component = codec_dai->component;
++	struct rt5630_priv *rt5630 = snd_soc_component_get_drvdata(component);
++	
++	if (((freq >= (256 * 44100)) && (freq <= (256 * 48000))) || freq == 0) {
++		rt5630->sysclk = freq;
++		return 0;
++	}
++	
++	printk(KERN_ERR "unsupported sysclk freq %u for audio i2s\n", freq);
++	return -EINVAL;
++}
++
++
++static int rt5630_hifi_codec_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
++{
++	struct snd_soc_component *component = codec_dai->component;
++	u16 iface = 0;
++
++	/*set master/slave interface*/
++	switch (fmt & SND_SOC_DAIFMT_MASTER_MASK)
++	{
++		case SND_SOC_DAIFMT_CBM_CFM:
++			iface = 0x0000;
++			break;
++		case SND_SOC_DAIFMT_CBS_CFS:
++			iface = 0x8000;
++			break;
++		default:
++			return -EINVAL;
++	}
++	
++	/*interface format*/
++	switch (fmt & SND_SOC_DAIFMT_FORMAT_MASK)
++	{
++		case SND_SOC_DAIFMT_I2S:
++			iface |= 0x0000;
++			break;
++		case SND_SOC_DAIFMT_LEFT_J:
++			iface |= 0x0001;
++			break;
++		case SND_SOC_DAIFMT_DSP_A:
++			iface |= 0x0002;
++			break;
++		case SND_SOC_DAIFMT_DSP_B:
++			iface |= 0x0003;
++			break;
++		default:
++			return -EINVAL;
++	}
++	
++	/*clock inversion*/
++	switch (fmt & SND_SOC_DAIFMT_INV_MASK)
++	{
++		case SND_SOC_DAIFMT_NB_NF:
++			iface |= 0x0000;
++			break;
++		case SND_SOC_DAIFMT_IB_NF:
++			iface |= 0x0080;
++			break;
++		default:
++			return -EINVAL;
++	}
++
++	snd_soc_component_write(component, RT5630_MAIN_SDP_CTRL, iface);
++	return 0;
++}
++
++
++struct _coeff_div_stereo
++{
++	unsigned int mclk;
++	unsigned int rate;
++	unsigned int reg60;
++	unsigned int reg62;
++};
++
++
++static const struct _coeff_div_stereo coeff_div_stereo[] = {
++		/*bclk is config to 64fs, armada510 use 64fs bclk */
++		{22579200, 44100, 0x3175, 0x1010},	
++		{24576000, 48000, 0x3175, 0x1010}, 
++		{11289600, 44100, 0x1175, 0x0000}, 
++		{12288000, 48000, 0x1175, 0x0000},
++		{0, 0, 0, 0},
++};
++
++
++static int get_coeff(unsigned int mclk, unsigned int rate)
++{
++	int i;
++	//printk(KERN_INFO "get_coeff mclk = %d, rate = %d\n", mclk, rate);
++
++	for (i = 0; i < ARRAY_SIZE(coeff_div_stereo); i++) 
++	{
++		if ((coeff_div_stereo[i].rate == rate) && (coeff_div_stereo[i].mclk == mclk))
++			return i;
++	}
++
++
++	return -EINVAL;
++	printk(KERN_ERR "get_coeff() can't find a matched mclk and rate\n");
++}
++
++static int rt5630_hifi_pcm_hw_params(struct snd_pcm_substream *substream, 
++			struct snd_pcm_hw_params *params,
++			struct snd_soc_dai *dai)
++{
++	struct snd_soc_component *component = dai->component;
++	struct rt5630_priv *rt5630 = snd_soc_component_get_drvdata(component);
++	int rate = params_rate(params);
++	
++	//struct snd_soc_dapm_widget *w;
++	//int stream = substream->stream;
++	
++	unsigned int iface = snd_soc_component_read(component, RT5630_MAIN_SDP_CTRL) & 0xfff3;
++	int coeff = get_coeff(rt5630->sysclk, rate);
++	
++	
++	switch (params_format(params))
++	{
++		case SNDRV_PCM_FORMAT_S16_LE:   
++			iface |= MAIN_I2S_DL_16;
++			break;
++		case SNDRV_PCM_FORMAT_S20_3LE:
++			iface |= MAIN_I2S_DL_20;
++			break;
++		case SNDRV_PCM_FORMAT_S24_LE:
++			iface |= MAIN_I2S_DL_24;
++			break;
++	}
++	snd_soc_component_write(component, RT5630_MAIN_SDP_CTRL, iface);
++	snd_soc_component_update_bits(component, RT5630_PWR_MANAG_ADD1, 0x0801, 0x0801);   /*power i2s and dac ref*/
++	if (coeff >= 0) 
++	{
++		snd_soc_component_write(component, RT5630_STEREO_DAC_CLK_CTRL1, coeff_div_stereo[coeff].reg60);
++		snd_soc_component_write(component, RT5630_STEREO_DAC_CLK_CTRL2, coeff_div_stereo[coeff].reg62);
++	}
++	else
++		return coeff;
++	
++	return 0;
++}
++
++static void hp_depop_mode2(struct snd_soc_component *component)
++{
++	snd_soc_component_update_bits(component, RT5630_PWR_MANAG_ADD1, PWR_MAIN_BIAS, PWR_MAIN_BIAS);
++	snd_soc_component_update_bits(component, RT5630_PWR_MANAG_ADD2, PWR_MIXER_VREF, PWR_MIXER_VREF);
++	snd_soc_component_update_bits(component, RT5630_PWR_MANAG_ADD1, PWR_SOFTGEN_EN, PWR_SOFTGEN_EN);
++	snd_soc_component_update_bits(component, RT5630_PWR_MANAG_ADD3, PWR_HP_R_OUT_VOL|PWR_HP_L_OUT_VOL, PWR_HP_R_OUT_VOL|PWR_HP_L_OUT_VOL);
++	snd_soc_component_update_bits(component, RT5630_MISC_CTRL, HP_DEPOP_MODE2_EN, HP_DEPOP_MODE2_EN);
++	msleep(300);
++	snd_soc_component_update_bits(component, RT5630_MISC_CTRL, HP_DEPOP_MODE2_EN, 0);
++	snd_soc_component_update_bits(component, RT5630_PWR_MANAG_ADD1, PWR_HP_OUT_ENH_AMP | PWR_HP_OUT_AMP, PWR_HP_OUT_ENH_AMP | PWR_HP_OUT_AMP);
++}
++
++static int rt5630_pcm_hw_prepare(struct snd_pcm_substream *substream, struct snd_soc_dai *dai)
++{
++	struct snd_soc_component *component = dai->component;
++	int stream = substream->stream;
++	u16 reg=0;
++	
++	switch (stream)
++	{
++		case SNDRV_PCM_STREAM_PLAYBACK:
++
++			snd_soc_component_update_bits(component,  RT5630_PWR_MANAG_ADD1, 0xC000, 0xC000);        //power on PWR_DAC_DF2SE_L R	
++			reg=snd_soc_component_read(component, 0x02);
++			//if (!(reg & 0x8080)) //always power on speaker amp
++			{
++				//power on SPK
++				snd_soc_component_update_bits(component, RT5630_PWR_MANAG_ADD2, 0x2338, 0x2338);        /*power hp mixerlr, daclr spkr_mixer */
++
++				snd_soc_component_update_bits(component,  RT5630_PWR_MANAG_ADD3, 0x3000, 0x3000);       /*power spklr volume*/
++				//snd_soc_component_update_bits(component,  0x02, 0x8080, 0x0000);        /*unmute spk*/
++				snd_soc_component_update_bits(component,  RT5630_PWR_MANAG_ADD1, 0x0400, 0x0400);        /*power on classabd amp*/			
++			}
++			
++			reg=snd_soc_component_read(component, 0x04);			
++			//if (!(reg & 0x8080)) //always power on hp amp
++			{
++				//power on hp
++				snd_soc_component_update_bits(component, RT5630_PWR_MANAG_ADD2, 0x2330, 0x2330);        /*power hp mixerlr, daclr*/
++				hp_depop_mode2(component);			
++
++				//snd_soc_component_update_bits(component,  0x04, 0x8080, 0x0000);        /*unmute hp*/				
++			}			
++
++
++			break;
++		case SNDRV_PCM_STREAM_CAPTURE:
++
++			snd_soc_component_update_bits(component, RT5630_PWR_MANAG_ADD3, PWR_MIC1_BOOST | PWR_MIC1_VOL_CTRL, PWR_MIC1_BOOST | PWR_MIC1_VOL_CTRL);        /*power on mic1 boost*/
++			snd_soc_component_update_bits(component, RT5630_PWR_MANAG_ADD1, PWR_MIC_BIAS1, PWR_MIC_BIAS1);        /*mic bias1*/
++			snd_soc_component_update_bits(component, RT5630_PWR_MANAG_ADD2, 0x00c3, 0x00c3);         /*power adc lr and rec mixer lr*/
++			msleep(500);
++			break;
++		default:
++			return 0;
++	}
++	return 0;	
++}
++
++static void rt5630_hifi_shutdown(struct snd_pcm_substream *substream, struct snd_soc_dai *dai)
++{
++	struct snd_soc_component *component = dai->component;
++	int stream = substream->stream;
++	switch (stream)
++	{		
++		case SNDRV_PCM_STREAM_PLAYBACK:
++            snd_soc_component_update_bits(component, RT5630_PWR_MANAG_ADD1, 0xdf01, 0x0000 );        //power off DAC path   mod!!!
++			snd_soc_component_update_bits(component, RT5630_PWR_MANAG_ADD2, 0x0330, 0x0000 );        /*power off hp mixerlr and daclr*/
++			snd_soc_component_update_bits(component, RT5630_PWR_MANAG_ADD3, 0x3c00, 0x0000 );        /*power off spklr volume*/		
++			break;
++			
++		case SNDRV_PCM_STREAM_CAPTURE:
++	
++			snd_soc_component_update_bits(component, RT5630_PWR_MANAG_ADD3, PWR_MIC1_BOOST | PWR_MIC1_VOL_CTRL, 0x0000 );        /*power off mic1 boost*/
++			snd_soc_component_update_bits(component, RT5630_PWR_MANAG_ADD1, PWR_MIC_BIAS1, 0x0000 );        /*mic bias1*/
++			snd_soc_component_update_bits(component, RT5630_PWR_MANAG_ADD2, 0x00c3, 0x0000 );        /*power off adc lr and rec mixer lr*/
++
++		   break;
++
++		default:
++			return;
++	}		
++}
++
++static int rt5630_set_bias_level(struct snd_soc_component *component,
++				      enum snd_soc_bias_level level)
++{
++	switch (level) {
++	case SND_SOC_BIAS_ON:
++		break;
++	case SND_SOC_BIAS_PREPARE:
++		break;
++	case SND_SOC_BIAS_STANDBY:
++		break;
++	case SND_SOC_BIAS_OFF:
++		snd_soc_component_update_bits(component, RT5630_PWR_MANAG_ADD1, 0x0300, 0x0000);
++		snd_soc_component_update_bits(component, 0x02, 0x8080, 0x8080);
++		snd_soc_component_update_bits(component, 0x04, 0x8080, 0x8080);
++		snd_soc_component_write(component, 0x3e, 0x0000);
++		snd_soc_component_write(component, RT5630_PWR_MANAG_ADD1, 0x0000);
++		snd_soc_component_write(component, 0x3c, 0x0000);
++		break;
++	}
++	return 0;
++}
++
++	
++#define RT5630_STEREO_RATES (SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_44100)
++
++#define RT5630_FORMATS (SNDRV_PCM_FMTBIT_S16_LE |\
++			SNDRV_PCM_FMTBIT_S24_LE |\
++			SNDRV_PCM_FMTBIT_S32)
++
++static const struct snd_soc_dai_ops rt5630_dai_ops = {
++		.hw_params = rt5630_hifi_pcm_hw_params,
++		.set_fmt = rt5630_hifi_codec_set_dai_fmt,
++		.set_sysclk = rt5630_set_dai_sysclk,
++		.set_pll = rt5630_codec_set_dai_pll,
++		.prepare = rt5630_pcm_hw_prepare, 
++		.shutdown = rt5630_hifi_shutdown, 
++		.no_capture_mute = 1,
++};
++
++static struct snd_soc_dai_driver rt5630_dai = {
++	.name = "rt5630-hifi",
++	.playback = {
++		.stream_name = "Playback",
++		.channels_min = 1,
++		.channels_max = 2,
++		//.rate_min =	8000,
++		//.rate_max =	48000,
++		.rates = RT5630_STEREO_RATES,
++		.formats = RT5630_FORMATS
++		},
++	.capture = {
++		.stream_name = "Capture",
++		.channels_min = 1,
++		.channels_max = 2,
++		//.rate_min =	8000,
++		//.rate_max =	48000,
++		.rates = RT5630_STEREO_RATES,
++		.formats = RT5630_FORMATS
++		},
++
++	.ops = &rt5630_dai_ops,
++};
++
++//supspend / resume not tested!!!
++static int rt5630_suspend(struct snd_soc_component *component)
++{
++	struct rt5630_priv *rt5630 = snd_soc_component_get_drvdata(component);
++	
++	snd_soc_component_write(component,  RT5630_PWR_MANAG_ADD1, 0x0000);  //0x3A
++	snd_soc_component_write(component,  RT5630_PWR_MANAG_ADD2, 0x0000);  //0x3C
++	snd_soc_component_write(component,  RT5630_PWR_MANAG_ADD3, 0x0000);  //0x3E 
++	
++	printk(KERN_INFO "rt5630_suspend() start\n");
++
++	regcache_cache_only(rt5630->regmap, true);
++
++	return 0;
++}
++
++static int rt5630_resume(struct snd_soc_component *component)
++{
++	struct rt5630_priv *rt5630 = snd_soc_component_get_drvdata(component);
++	int ret;
++	printk(KERN_INFO "rt5630_resume() start\n");
++	
++	snd_soc_component_update_bits(component, RT5630_PWR_MANAG_ADD1, 0x0802, 0x0802); //0x3A
++	snd_soc_component_update_bits(component, RT5630_PWR_MANAG_ADD2, 0xa000, 0xa000); //0x3C
++
++	msleep(1000);
++
++	/* Sync reg_cache with the hardware */
++	regcache_cache_only(rt5630->regmap, false);
++	ret = regcache_sync(rt5630->regmap);
++	if (ret != 0) {
++		dev_err(component->dev, "Failed to sync register cache: %d\n",
++			ret);
++		regcache_cache_only(rt5630->regmap, true);
++		return ret;
++	}
++	
++	rt5630_set_bias_level(component, SND_SOC_BIAS_ON);
++	return 0;
++}
++
++static int rt5630_reg_init(struct snd_soc_component *component)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(rt5630_init_list); i++)
++		snd_soc_component_write(component, rt5630_init_list[i].reg_index, rt5630_init_list[i].reg_value);
++
++	return 0;
++}
++
++static int rt5630_probe(struct snd_soc_component *component)
++{
++	snd_soc_component_write(component, RT5630_RESET, 0);  //reset codec
++	
++	snd_soc_component_write(component,  RT5630_PD_CTRL_STAT, 0);
++	snd_soc_component_write(component,  RT5630_PWR_MANAG_ADD1, PWR_MAIN_BIAS);
++	snd_soc_component_write(component,  RT5630_PWR_MANAG_ADD2, PWR_MIXER_VREF);
++
++	msleep(500);	
++	rt5630_reg_init(component);
++	rt5630_set_bias_level(component, SND_SOC_BIAS_PREPARE);
++
++	snd_soc_add_component_controls(component, rt5630_snd_controls, ARRAY_SIZE(rt5630_snd_controls));
++
++	return 0;
++}
++
++static const struct snd_soc_component_driver soc_component_device_rt5630 = {
++	.probe			= rt5630_probe,
++	.suspend		= rt5630_suspend,
++	.resume			= rt5630_resume,
++	.set_bias_level		= rt5630_set_bias_level,
++	.suspend_bias_off	= 1,
++	.idle_bias_on		= 1,
++	.use_pmdown_time	= 1,
++	.endianness		= 1,
++};
++
++static const struct regmap_config rt5630_regmap = {
++	.reg_bits = 8,
++	.val_bits = 16,
++	.reg_stride = 2,
++	
++	.use_single_read = true,  
++	.use_single_write = true, 
++	
++	//.volatile_reg = rt5630_volatile_register,
++	//.readable_reg = rt5630_readable_register,
++
++	.max_register = RT5630_VENDOR_ID2,
++	.cache_type = REGCACHE_RBTREE,
++};
++
++static const struct i2c_device_id rt5630_i2c_table[] = {
++	{"rt5630", 0x7c},  
++	{}
++};
++MODULE_DEVICE_TABLE(i2c, rt5630_i2c_table);
++
++static int rt5630_i2c_probe(struct i2c_client *client)
++{
++	struct rt5630_priv *rt5630;
++	//struct device_node *np;
++	unsigned int vid1, vid2;
++	int ret;
++	//u32 val32;
++	const struct i2c_device_id *id;
++
++	rt5630 = devm_kzalloc(&client->dev, sizeof(struct rt5630_priv),
++			       GFP_KERNEL);
++	if (rt5630 == NULL)
++		return -ENOMEM;
++
++	rt5630->regmap = devm_regmap_init_i2c(client, &rt5630_regmap);
++	if (IS_ERR(rt5630->regmap)) {
++		ret = PTR_ERR(rt5630->regmap);
++		dev_err(&client->dev, "Failed to initialise I/O: %d\n", ret);
++		return ret;
++	}
++
++	ret = regmap_read(rt5630->regmap, RT5630_VENDOR_ID1, &vid1);
++	if (ret < 0) {
++		dev_err(&client->dev, "failed to read vendor ID1: %d\n", ret);
++		return ret;
++	}
++	
++	ret = regmap_read(rt5630->regmap, RT5630_VENDOR_ID2, &vid2);
++	if (ret < 0) {
++		dev_err(&client->dev, "failed to read vendor ID2: %d\n", ret);
++		return ret;
++	}
++	vid2 >>= 8;
++
++	id = i2c_match_id(rt5630_i2c_table, client);
++	
++	if ((vid1 != 0x10ec) || (vid2 != id->driver_data)) {
++		dev_err(&client->dev, "unknown or wrong codec\n");
++		dev_err(&client->dev, "Expected %x:%lx, got %x:%x\n",
++				0x10ec, id->driver_data,
++				vid1, vid2);
++		return -ENODEV;
++	}
++
++	rt5630->id = vid2;
++	rt5630_dai.name = "rt5630-hifi";
++	
++
++	i2c_set_clientdata(client, rt5630);
++
++	ret =  devm_snd_soc_register_component(&client->dev,
++		&soc_component_device_rt5630, &rt5630_dai, 1);
++		
++	if (ret != 0)
++		dev_err(&client->dev, "Failed to register codec: %d\n", ret);
++
++	return ret;
++}
++
++
++
++#ifdef CONFIG_OF
++static const struct of_device_id rt5630_of_match[] = {
++	{ .compatible = "realtek,rt5630", },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, rt5630_of_match);
++#endif
++
++/*  i2c codec control layer */
++static struct i2c_driver rt5630_i2c_driver = {
++	.driver = {
++		.name = "rt5630-codec",
++		.of_match_table = of_match_ptr(rt5630_of_match),
++	},
++	.probe_new = rt5630_i2c_probe,
++	.id_table = rt5630_i2c_table,
++};
++
++module_i2c_driver(rt5630_i2c_driver);
++
++MODULE_DESCRIPTION("ASoC rt5630 driver");
++MODULE_AUTHOR("balux33");
++MODULE_LICENSE("GPL");
+--- /dev/null
++++ b/sound/soc/codecs/rt5630.h
+@@ -0,0 +1,671 @@
++#ifndef _RT5630_H
++#define _RT5630_H
++
++#define RT5630_RESET						0X00			//RESET CODEC TO DEFAULT
++#define RT5630_SPK_OUT_VOL					0X02			//SPEAKER OUT VOLUME
++#define RT5630_HP_OUT_VOL					0X04			//HEADPHONE OUTPUT VOLUME
++#define RT5630_AUX_OUT_VOL					0X06			//AUXOUT VOLUME
++#define RT5630_PHONEIN_VOL					0X08			//PHONE INPUT VOLUME
++#define RT5630_LINE_IN_VOL					0X0A			//LINE IN VOLUME
++#define RT5630_STEREO_DAC_VOL				0X0C			//STEREO DAC VOLUME
++#define RT5630_MIC_VOL						0X0E			//MICROPHONE VOLUME
++#define RT5630_DAC_AND_MIC_CTRL				0X10			//STEREO DAC AND MIC ROUTING CONTROL
++#define RT5630_ADC_REC_GAIN					0X12			//ADC RECORD GAIN
++#define RT5630_ADC_REC_MIXER				0X14			//ADC RECORD MIXER CONTROL
++#define RT5630_VOICE_DAC_OUT_VOL			0X18			//VOICE DAC OUTPUT VOLUME
++#define RT5630_VODSP_PDM_CTL				0X1A			//VODSP & PDM CONTROL
++#define RT5630_OUTPUT_MIXER_CTRL			0X1C			//OUTPUT MIXER CONTROL
++#define RT5630_VODSP_CTL					0X1E			//VODSP CONTROL
++#define RT5630_MIC_CTRL						0X22			//MICROPHONE CONTROL
++#define RT5630_DMIC_CTRL					0x24
++#define RT5630_PD_CTRL_STAT					0X26			//POWER DOWN CONTROL/STATUS
++#define RT5630_DAC_ADC_VODAC_FUN_SEL		0X2E			//STEREO DAC,VOICE DAC,STEREO ADC FUNCTION SELECT
++#define	RT5630_MAIN_SDP_CTRL				0X34			//MAIN SERIAL DATA PORT CONTROL(STEREO I2S)
++#define RT5630_EXTEND_SDP_CTRL				0X36			//EXTEND SERIAL DATA PORT CONTROL(VOICE I2S/PCM)
++#define	RT5630_PWR_MANAG_ADD1				0X3A			//POWER MANAGMENT ADDITION 1
++#define RT5630_PWR_MANAG_ADD2				0X3C			//POWER MANAGMENT ADDITION 2
++#define RT5630_PWR_MANAG_ADD3				0X3E			//POWER MANAGMENT ADDITION 3
++#define RT5630_GEN_CTRL_REG1				0X40			//GENERAL PURPOSE CONTROL REGISTER 1
++#define	RT5630_GEN_CTRL_REG2				0X42			//GENERAL PURPOSE CONTROL REGISTER 2
++#define RT5630_PLL_CTRL						0X44			//PLL1 CONTROL
++#define RT5630_PLL2_CTRL					0X46			//PLL2 CONTROL
++#define RT5630_LDO_CTRL						0X48			//LDO CONTROL
++#define RT5630_GPIO_PIN_CONFIG				0X4C			//GPIO PIN CONFIGURATION
++#define RT5630_GPIO_PIN_POLARITY			0X4E			//GPIO PIN POLARITY	
++#define RT5630_GPIO_PIN_STICKY				0X50			//GPIO PIN STICKY	
++#define RT5630_GPIO_PIN_WAKEUP				0X52			//GPIO PIN WAKE UP
++#define RT5630_GPIO_PIN_STATUS				0X54			//GPIO PIN STATUS
++#define RT5630_GPIO_PIN_SHARING				0X56			//GPIO PIN SHARING
++#define	RT5630_OVER_TEMP_CURR_STATUS		0X58			//OVER TEMPERATURE AND CURRENT STATUS
++#define RT5630_SOFT_VOL_CTRL				0X5A			//SOFT VOLUME CONTROL SETTING
++#define RT5630_GPIO_OUT_CTRL				0X5C			//GPIO OUTPUT PIN CONTRL
++#define RT5630_MISC_CTRL					0X5E			//MISC CONTROL
++#define	RT5630_STEREO_DAC_CLK_CTRL1			0X60			//STEREO DAC CLOCK CONTROL 1
++#define RT5630_STEREO_DAC_CLK_CTRL2			0X62			//STEREO DAC CLOCK CONTROL 2
++#define RT5630_VOICE_DAC_PCMCLK_CTRL1		0X64			//VOICE/PCM DAC CLOCK CONTROL 1
++#define RT5630_PSEDUEO_SPATIAL_CTRL			0X68			//PSEDUEO STEREO /SPATIAL EFFECT BLOCK CONTROL
++#define RT5630_PRIV_ADDR					0X6A			//PRIVATE ADDRESS
++#define RT5630_PRIV_DATA					0X6C			//PRIVATE DATA 
++#define RT5630_EQ_CTRL_ADC_HPF				0X6E			//EQ CONTROL AND STATUS /ADC HPF CONTROL
++#define RT5630_VODSP_REG_ADDR 		    	0x70			//VODSP REGISTER ADDRESS
++#define RT5630_VODSP_REG_DATA 		    	0x72			//VODSP REGISTER DATA
++#define RT5630_VODSP_REG_CMD 			    0x74			//VODSP REGISTER COMMAND
++
++#define RT5630_VENDOR_ID1					0x7C
++#define RT5630_VENDOR_ID2					0x7E
++
++
++/**************************************************************************************************
++ *Bit define of Codec Register
++ *************************************************************************************************/
++//global definition
++#define RT_L_MUTE						(0x1<<15)		//Mute Left Control
++#define RT_L_ZC							(0x1<<14)		//Mute Left Zero-Cross Detector Control
++#define RT_R_MUTE						(0x1<<7)		//Mute Right Control
++#define RT_R_ZC							(0x1<<6)		//Mute Right Zero-Cross Detector Control
++#define RT_M_HP_MIXER					(0x1<<15)		//Mute source to HP Mixer
++#define RT_M_SPK_MIXER					(0x1<<14)		//Mute source to Speaker Mixer
++#define RT_M_MONO_MIXER					(0x1<<13)		//Mute source to Mono Mixer
++
++//Phone Input Volume(0x08)
++#define M_PHONEIN_TO_HP_MIXER			(0x1<<15)		//Mute Phone In volume to HP mixer
++#define M_PHONEIN_TO_SPK_MIXER			(0x1<<14)		//Mute Phone In volume to speaker mixer
++
++
++//Mic Routing Control(0x10)
++#define M_MIC1_TO_HP_MIXER				(0x1<<15)		//Mute MIC1 to HP mixer
++#define M_MIC1_TO_SPK_MIXER				(0x1<<14)		//Mute MiC1 to SPK mixer
++#define M_MIC1_TO_MONO_MIXER			(0x1<<13)		//Mute MIC1 to MONO mixer
++#define M_MIC2_TO_HP_MIXER				(0x1<<11)		//Mute MIC2 to HP mixer
++#define M_MIC2_TO_SPK_MIXER				(0x1<<10)		//Mute MiC2 to SPK mixer
++#define M_MIC2_TO_MONO_MIXER			(0x1<<9)		//Mute MIC2 to MONO mixer
++#define M_DAC_TO_HPL_MIXER				(0x1<<3)		//Mute DAC to HP left mixer
++#define M_DAC_TO_HPR_MIXER				(0x1<<2)		//Mute DAC to HP right mixer
++#define M_DAC_TO_SPK_MIXER				(0x1<<1)		//Mute DAC to SPK mixer
++#define M_DAC_TO_MONO_MIXER				(0x1<<0)		//Mute DAC to MONO mixer
++
++
++
++//ADC Record Gain(0x12)
++#define M_ADC_L_TO_HP_MIXER				(0x1<<15)		//Mute left of ADC to HP Mixer
++#define M_ADC_L_TO_MONO_MIXER			(0x1<<14)		//Mute left of ADC to MONO Mixer
++#define ADC_L_ZC_DET					(0x1<<13)		//ADC Zero-Cross Detector Control
++#define ADC_L_GAIN_MASK					(0x1f<<8)		//ADC Record Gain Left channel Mask
++#define M_ADC_R_TO_HP_MIXER				(0x1<<7)		//Mute right of ADC to HP Mixer
++#define M_ADC_R_TO_MONO_MIXER			(0x1<<6)		//Mute right of ADC to MONO Mixer
++#define ADC_R_ZC_DET					(0x1<<5)		//ADC Zero-Cross Detector Control
++#define ADC_R_GAIN_MASK					(0x1f<<0)		//ADC Record Gain Right channel Mask
++
++//Voice DAC Output Volume(0x18)
++#define M_V_DAC_TO_HP_MIXER				(0x1<<15)
++#define M_V_DAC_TO_SPK_MIXER			(0x1<<14)
++#define M_V_DAC_TO_MONO_MIXER			(0x1<<13)
++
++
++//AEC & PDM Control(0x1A)
++#define VODSP_SRC1_PWR					(0x1<<15)		//Enable SRC1 Power
++#define VODSP_SRC2_PWR					(0x1<<13)		//Enable SRC2 Power
++
++#define VODSP_SRC2_S_SEL_MASK			(0x1<<12)		
++#define VODSP_SRC2_S_SEL_TXDP			(0x0<<12)		//SRC2 source select AEC_TXDP
++#define VODSP_SRC2_S_SEL_TXDC			(0x1<<12)		//SRC2 source select AEC_TXDC
++
++#define VODSP_RXDP_PWR					(0x1<<11)		//Enable AEC RXDP Power
++
++#define VODSP_RXDP_S_SEL_MASK			(0x3<<9)		
++#define VODSP_RXDP_S_SEL_SRC1			(0x0<<9)		//AEC RxDP source select SRC1 Output
++#define VODSP_RXDP_S_SEL_ADCL			(0x1<<9)		//AEC RxDP source select ADC Left to AEC Digital Path
++#define VODSP_RXDP_S_SEL_VOICE			(0x2<<9)		//AEC RxDP source select Voice to Stereo Digital Path
++#define VODSP_RXDP_S_SEL_ADCR			(0x3<<9)		//AEC RxDP source select ADC Right to AEC Digital Path
++
++#define VODSP_RXDC_PWR					(0x1<<8)		//Enable AEC RXDC Power
++
++#define VOICE_PCM_S_SEL_MASK			(0x1<<7)		
++#define VOICE_PCM_S_SEL_ADC_R			(0x0<<7)		//VSADC PCM interface source select ADC R
++#define VOICE_PCM_S_SEL_AEC_TXDP		(0x1<<7)		//VSADC PCM interface source select AEC_TXDP
++
++#define REC_S_SEL_MASK					(0x3<<4)		
++#define REC_S_SEL_ADC					(0x0<<4)		//Main Stereo Record I2S source select ADC L/R
++#define REC_S_SEL_VOICE					(0x1<<4)		//Main Stereo Record I2S source select Voice to Stereo Digital Path
++#define REC_S_SEL_SRC2					(0x2<<4)		//Main Stereo Record I2S source select SRC2
++
++
++//Output Mixer Control(0x1C)
++#define	SPKOUT_N_SOUR_MASK				(0x3<<14)	
++#define	SPKOUT_N_SOUR_LN				(0x2<<14)
++#define	SPKOUT_N_SOUR_RP				(0x1<<14)
++#define	SPKOUT_N_SOUR_RN				(0x0<<14)
++
++#define SPKOUT_SEL_CLASS_D				(0x1<<13)
++#define SPKOUT_SEL_CLASS_AB				(0x0<<13)
++
++#define SPK_CLASS_AB_S_AMP				(0x0<<12)
++#define SPK_CALSS_AB_W_AMP				(0x1<<12)
++
++#define SPKOUT_INPUT_SEL_MASK			(0x3<<10)
++#define SPKOUT_INPUT_SEL_MONOMIXER		(0x3<<10)
++#define SPKOUT_INPUT_SEL_SPKMIXER		(0x2<<10)
++#define SPKOUT_INPUT_SEL_HPMIXER		(0x1<<10)
++#define SPKOUT_INPUT_SEL_VMID			(0x0<<10)
++
++#define HPL_INPUT_SEL_HPLMIXER			(0x1<<9)
++#define HPR_INPUT_SEL_HPRMIXER			(0x1<<8)	
++
++#define AUXOUT_INPUT_SEL_MASK			(0x3<<6)
++#define AUXOUT_INPUT_SEL_MONOMIXER		(0x3<<6)
++#define AUXOUT_INPUT_SEL_SPKMIXER		(0x2<<6)
++#define AUXOUT_INPUT_SEL_HPMIXER		(0x1<<6)
++#define AUXOUT_INPUT_SEL_VMID			(0x0<<6)
++
++#define DAC_HP_DIRECT_MODE_L            (0x1<<1)   //realy?  1-> enable
++#define DAC_HP_DIRECT_MODE_R            (0x1<<0)   //realy?
++
++
++//Voice DSP Control(0x1E)
++#define VODSP_SYSCLK_S_SEL_MASK		 	(0x1<<15)
++#define VODSP_SYSCLK_S_SEL_M_CLK	 	(0x0<<15)
++#define VODSP_SYSCLK_S_SEL_V_CLK	 	(0x1<<15)
++
++#define VODSP_LRCK_SEL_MASK				(0x1<<13)
++#define VODSP_LRCK_SEL_8K				(0x0<<13)
++#define VODSP_LRCK_SEL_16K				(0x1<<13)
++
++#define VODSP_TEST_MODE_ENA				(0x1<<3)
++#define VODSP_NO_BP_MODE_ENA			(0x1<<2)
++#define VODSP_NO_PD_MODE_ENA			(0x1<<1)
++#define VODSP_NO_RST_MODE_ENA			(0x1<<0)
++
++
++
++
++//Micphone Control define(0x22)
++#define MIC1		1
++#define MIC2		2
++#define MIC_BIAS_90_PRECNET_AVDD	1
++#define	MIC_BIAS_75_PRECNET_AVDD	2
++
++#define MIC1_BOOST_CONTROL_MASK		(0x3<<10)
++#define MIC1_BOOST_CONTROL_BYPASS	(0x0<<10)
++#define MIC1_BOOST_CONTROL_20DB		(0x1<<10)
++#define MIC1_BOOST_CONTROL_30DB		(0x2<<10)
++#define MIC1_BOOST_CONTROL_40DB		(0x3<<10)
++
++#define MIC2_BOOST_CONTROL_MASK		(0x3<<8)
++#define MIC2_BOOST_CONTROL_BYPASS	(0x0<<8)
++#define MIC2_BOOST_CONTROL_20DB		(0x1<<8)
++#define MIC2_BOOST_CONTROL_30DB		(0x2<<8)
++#define MIC2_BOOST_CONTROL_40DB		(0x3<<8)
++
++#define MIC1_BIAS_VOLT_CTRL_MASK	(0x1<<5)
++#define MIC1_BIAS_VOLT_CTRL_90P		(0x0<<5)
++#define MIC1_BIAS_VOLT_CTRL_75P		(0x1<<5)
++
++#define MIC2_BIAS_VOLT_CTRL_MASK	(0x1<<4)
++#define MIC2_BIAS_VOLT_CTRL_90P		(0x0<<4)
++#define MIC2_BIAS_VOLT_CTRL_75P		(0x1<<4)
++
++//PowerDown control of register(0x26)
++//power management bits
++#define RT_PWR_PR7					(0x1<<15)	//write this bit to power down the Speaker Amplifier
++#define RT_PWR_PR6					(0x1<<14)	//write this bit to power down the Headphone Out and MonoOut
++#define RT_PWR_PR5					(0x1<<13)	//write this bit to power down the internal clock(without PLL)
++#define RT_PWR_PR3					(0x1<<11)	//write this bit to power down the mixer(vref/vrefout out off)
++#define RT_PWR_PR2					(0x1<<10)	//write this bit to power down the mixer(vref/vrefout still on)
++#define RT_PWR_PR1					(0x1<<9) 	//write this bit to power down the dac
++#define RT_PWR_PR0					(0x1<<8) 	//write this bit to power down the adc
++#define RT_PWR_REF					(0x1<<3)	//read only
++#define RT_PWR_ANL					(0x1<<2)	//read only	
++#define RT_PWR_DAC					(0x1<<1)	//read only
++#define RT_PWR_ADC					(0x1)		//read only
++
++
++//Stereo DAC/Voice DAC/Stereo ADC function(0x2E)
++#define DAC_FUNC_SEL_MASK			(0x3<<12)
++#define DAC_FUNC_SEL_DAC			(0x0<<12)		
++#define DAC_FUNC_SEL_SRC2			(0x1<<12)
++#define DAC_FUNC_SEL_VODSP_TXDP		(0x2<<12)
++#define DAC_FUNC_SEL_VODSP_TXDC		(0x3<<12)
++
++#define VODAC_SOUR_SEL_MASK			(0x7<<8)
++#define VODAC_SOUR_SEL_VOICE		(0x0<<8)	
++#define VODAC_SOUR_SEL_SRC2			(0x1<<8)
++#define VODAC_SOUR_SEL_VODSP_TXDP	(0x2<<8)
++#define VODAC_SOUR_SEL_VODSP_TXDC	(0x3<<8)
++
++#define ADCR_FUNC_SEL_MASK			(0x3<<4)
++#define ADCR_FUNC_SEL_ADC			(0x0<<4)
++#define ADCR_FUNC_SEL_VOADC			(0x1<<4)
++#define ADCR_FUNC_SEL_VODSP			(0x2<<4)
++#define ADCR_FUNC_SEL_PDM			(0x3<<4)
++
++#define ADCL_FUNC_SEL_MASK			(0x3<<0)
++#define ADCL_FUNC_SEL_ADC			(0x0<<0)
++#define ADCL_FUNC_SEL_VODSP			(0x1<<0)
++
++//Main Serial Data Port Control(0x34)			
++#define MAIN_I2S_MODE_SEL			(0x1<<15)		//0:Master mode 1:Slave mode
++#define MAIN_I2S_SADLRCK_CTRL		(0x1<<14)		//0:Disable,ADC and DAC use the same fs,1:Enable
++
++#define MAIN_I2S_PCM_MODE			(0x1<<6)		//0:Normal SADLRCK/SDALRCK,1:Invert SADLRCK/SDALRCK 
++//Data Length Slection
++#define MAIN_I2S_DL_MASK			(0x3<<2)		//main i2s Data Length mask	
++#define MAIN_I2S_DL_16				(0x0<<2)		//16 bits
++#define MAIN_I2S_DL_20				(0x1<<2)		//20 bits
++#define	MAIN_I2S_DL_24				(0x2<<2)		//24 bits
++#define MAIN_I2S_DL_32				(0x3<<2)		//8 bits
++
++//PCM Data Format Selection
++#define MAIN_I2S_DF_MASK			(0x3)			//main i2s Data Format mask
++#define MAIN_I2S_DF_I2S				(0x0)			//I2S FORMAT 
++#define MAIN_I2S_DF_LEFT			(0x1)			//LEFT JUSTIFIED format
++#define	MAIN_I2S_DF_PCM_A			(0x2)			//PCM Mode A
++#define MAIN_I2S_DF_PCM_B				(0x3)			//PCM Mode B
++
++//Extend Serial Data Port Control(0x36)
++#define EXT_I2S_FUNC_ENABLE			(0x1<<15)		//Enable PCM interface on GPIO 1,3,4,5  0:GPIO function,1:Voice PCM interface
++#define EXT_I2S_MODE_SEL			(0x1<<14)		//0:Master	,1:Slave
++#define EXT_I2S_AUTO_CLK_CTRL		(0x1<<13)		//0:Disable,1:Enable
++#define EXT_I2S_BCLK_POLARITY		(0x1<<7)		//0:Normal 1:Invert
++#define EXT_I2S_PCM_MODE			(0x1<<6)		//0:Normal VSLRCK,1:Invert VSLRCK 
++//Data Length Slection
++#define EXT_I2S_DL_MASK				(0x3<<2)		//Extend i2s Data Length mask	
++#define EXT_I2S_DL_32				(0x3<<2)		//8 bits
++#define	EXT_I2S_DL_24				(0x2<<2)		//24 bits
++#define EXT_I2S_DL_20				(0x1<<2)		//20 bits
++#define EXT_I2S_DL_16				(0x0<<2)		//16 bits
++
++//Voice Data Format
++#define EXT_I2S_DF_MASK				(0x3)			//Extend i2s Data Format mask
++#define EXT_I2S_DF_I2S				(0x0)			//I2S FORMAT 
++#define EXT_I2S_DF_LEFT				(0x1)			//LEFT JUSTIFIED format
++#define	EXT_I2S_DF_PCM_A			(0x2)			//PCM Mode A
++#define EXT_I2S_DF_PCM_B			(0x3)			//PCM Mode B
++
++//Power managment addition 1 (0x3A),0:Disable,1:Enable
++#define PWR_DAC_DF2SE_L				(0x1<<15)  //enable this!!!
++#define PWR_DAC_DF2SE_R				(0x1<<14)   //enable this!!!
++#define PWR_ZC_DET_PD				(0x1<<13)
++#define PWR_I2S_INTERFACE			(0x1<<11)
++#define PWR_AMP_POWER				(0x1<<10)
++#define PWR_HP_OUT_AMP				(0x1<<9)
++#define PWR_HP_OUT_ENH_AMP			(0x1<<8)
++#define PWR_VOICE_DF2SE				(0x1<<7)
++#define PWR_SOFTGEN_EN				(0x1<<6)	
++#define	PWR_MIC_BIAS1_DET			(0x1<<5)
++#define	PWR_MIC_BIAS2_DET			(0x1<<4)
++#define PWR_MIC_BIAS1				(0x1<<3)	
++#define PWR_MIC_BIAS2				(0x1<<2)	
++#define PWR_MAIN_BIAS				(0x1<<1)
++#define PWR_DAC_REF					(0x1)
++
++
++//Power managment addition 2(0x3C),0:Disable,1:Enable
++#define PWR_PLL1					(0x1<<15)
++#define PWR_PLL2					(0x1<<14)
++#define PWR_MIXER_VREF				(0x1<<13)
++#define PWR_TEMP_SENSOR				(0x1<<12)
++#define PWR_AUX_ADC					(0x1<<11)
++#define PWR_VOICE_CLOCK				(0x1<<10)
++#define PWR_L_DAC_CLK				(0x1<<9)
++#define PWR_R_DAC_CLK				(0x1<<8)
++#define PWR_L_ADC_CLK				(0x1<<7)
++#define PWR_R_ADC_CLK				(0x1<<6)
++#define PWR_L_HP_MIXER				(0x1<<5)   //enable this!!!!!!!!!!!!!!!!!!
++#define PWR_R_HP_MIXER				(0x1<<4)   //enable this!!!!!!!!!!!!!!!!!!
++#define PWR_SPK_MIXER				(0x1<<3)
++#define PWR_MONO_MIXER				(0x1<<2)
++#define PWR_L_ADC_REC_MIXER			(0x1<<1)
++#define PWR_R_ADC_REC_MIXER			(0x1)
++
++
++//Power managment addition 3(0x3E),0:Disable,1:Enable
++#define PWR_OSC_EN					(0x1<<15)
++#define PWR_AUXOUT_VOL				(0x1<<14)
++#define PWR_SPK_OUT					(0x1<<13)
++#define PWR_SPK_OUT_N				(0x1<<12)
++#define PWR_HP_L_OUT_VOL			(0x1<<11)
++#define PWR_HP_R_OUT_VOL			(0x1<<10)
++#define PWR_VODSP_INTERFACE			(0x1<<9)
++#define PWR_I2C_FOR_VODSP			(0x1<<8)
++#define PWR_LINE_IN_L				(0x1<<7)
++#define PWR_LINE_IN_R				(0x1<<6)
++#define PWR_PHONE_VOL				(0x1<<5)
++#define PWR_PHONE_ADMIXER			(0x1<<4)
++#define PWR_MIC1_VOL_CTRL			(0x1<<3)
++#define PWR_MIC2_VOL_CTRL			(0x1<<2)
++#define PWR_MIC1_BOOST				(0x1<<1)
++#define PWR_MIC2_BOOST				(0x1)
++
++//General Purpose Control Register 1(0x40)
++#define GP_CLK_FROM_PLL				(0x1<<15)	
++#define GP_CLK_FROM_MCLK			(0x0<<15)	
++
++#define GP_DAC_HI_PA_ENA			(0x1<<10)	//Enable DAC High Pass Filter
++
++#define GP_EXTCLK_S_SEL_PLL2		(0x1<<6)
++#define GP_EXTCLK_S_SEL_PLL1		(0x0<<6)	
++
++#define GP_EXTCLK_DIR_SEL_OUTPUT	(0x1<<5)
++#define GP_EXTCLK_DIR_SEL_INTPUT	(0x0<<5)
++
++#define GP_VOSYS_S_SEL_PLL2			(0x0<<4)
++#define GP_VOSYS_S_SEL_EXTCLK		(0x1<<4)
++
++#define GP_SPK_AMP_CTRL_MASK		(0x7<<1)
++#define GP_SPK_AMP_CTRL_RATIO_225	(0x0<<1)		//2.25 Vdd
++#define GP_SPK_AMP_CTRL_RATIO_200	(0x1<<1)		//2.00 Vdd
++#define GP_SPK_AMP_CTRL_RATIO_175	(0x2<<1)		//1.75 Vdd
++#define GP_SPK_AMP_CTRL_RATIO_150	(0x3<<1)		//1.50 Vdd
++#define GP_SPK_AMP_CTRL_RATIO_125	(0x4<<1)		//1.25 Vdd	
++#define GP_SPK_AMP_CTRL_RATIO_100	(0x5<<1)		//1.00 Vdd
++
++//General Purpose Control Register 2(0x42)
++#define GP2_PLL1_SOUR_SEL_MASK		(0x3<<12)
++#define GP2_PLL1_SOUR_SEL_MCLK		(0x0<<12)
++#define GP2_PLL1_SOUR_SEL_BCLK		(0x2<<12)
++#define GP2_PLL1_SOUR_SEL_VBCLK		(0x3<<12)
++
++//PLL Control(0x44)
++#define PLL_M_CODE_MASK				0xF				//PLL M code mask
++#define PLL_K_CODE_MASK				(0x7<<4)		//PLL K code mask
++#define PLL_BYPASS_N				(0x1<<7)		//bypass PLL N code
++#define PLL_N_CODE_MASK				(0xFF<<8)		//PLL N code mask
++
++#define PLL_CTRL_M_VAL(m)		((m)&0xf)
++#define PLL_CTRL_K_VAL(k)		(((k)&0x7)<<4)
++#define PLL_CTRL_N_VAL(n)		(((n)&0xff)<<8)
++
++//PLL2 CONTROL
++#define PLL2_ENA					(0x1<<15)
++#define PLL_2_RATIO_8X				(0x0)
++#define PLL_2_RATIO_16X				(0x1)
++
++//LDO Control(0x48)
++#define LDO_ENABLE					(0x1<<15)
++
++#define LDO_OUT_VOL_CTRL_MASK		(0xf<<0)
++#define LDO_OUT_VOL_CTRL_1_55V		(0xf<<0)
++#define LDO_OUT_VOL_CTRL_1_50V		(0xe<<0)
++#define LDO_OUT_VOL_CTRL_1_45V		(0xd<<0)
++#define LDO_OUT_VOL_CTRL_1_40V		(0xc<<0)
++#define LDO_OUT_VOL_CTRL_1_35V		(0xb<<0)
++#define LDO_OUT_VOL_CTRL_1_30V		(0xa<<0)
++#define LDO_OUT_VOL_CTRL_1_25V		(0x9<<0)
++#define LDO_OUT_VOL_CTRL_1_20V		(0x8<<0)
++#define LDO_OUT_VOL_CTRL_1_15V		(0x7<<0)
++#define LDO_OUT_VOL_CTRL_1_05V		(0x6<<0)
++#define LDO_OUT_VOL_CTRL_1_00V		(0x5<<0)
++#define LDO_OUT_VOL_CTRL_0_95V		(0x4<<0)
++#define LDO_OUT_VOL_CTRL_0_90V		(0x3<<0)
++#define LDO_OUT_VOL_CTRL_0_85V		(0x2<<0)
++#define LDO_OUT_VOL_CTRL_0_80V		(0x1<<0)
++#define LDO_OUT_VOL_CTRL_0_75V		(0x0<<0)
++
++
++
++//GPIO Pin Configuration(0x4C)
++#define GPIO_1						(0x1<<1)
++#define	GPIO_2						(0x1<<2)
++#define	GPIO_3						(0x1<<3)
++#define GPIO_4						(0x1<<4)
++#define GPIO_5						(0x1<<5)
++
++
++////INTERRUPT CONTROL(0x5E)
++#define DISABLE_FAST_VREG			(0x1<<15)
++
++#define AVC_TARTGET_SEL_MASK		(0x3<<12)
++#define	AVC_TARTGET_SEL_NONE		(0x0<<12)
++#define	AVC_TARTGET_SEL_R 			(0x1<<12)
++#define	AVC_TARTGET_SEL_L			(0x2<<12)
++#define	AVC_TARTGET_SEL_BOTH		(0x3<<12)
++
++#define HP_DEPOP_MODE2_EN			(0x1<<8)
++#define HP_DEPOP_MODE1_EN			(0x1<<9)
++#define HP_L_M_UM_DEPOP_EN			(0x1<<7)
++#define HP_R_M_UM_DEPOP_EN			(0x1<<6)
++#define M_UM_DEPOP_EN				(0x1<<5)
++
++//Stereo DAC Clock Control 1(0x60)
++#define STEREO_BCLK_DIV1_MASK		(0xF<<12)
++#define STEREO_BCLK_DIV1_1			(0x0<<12)
++#define STEREO_BCLK_DIV1_2			(0x1<<12)
++#define STEREO_BCLK_DIV1_3			(0x2<<12)
++#define STEREO_BCLK_DIV1_4			(0x3<<12)
++#define STEREO_BCLK_DIV1_5			(0x4<<12)
++#define STEREO_BCLK_DIV1_6			(0x5<<12)
++#define STEREO_BCLK_DIV1_7			(0x6<<12)
++#define STEREO_BCLK_DIV1_8			(0x7<<12)
++#define STEREO_BCLK_DIV1_9			(0x8<<12)
++#define STEREO_BCLK_DIV1_10			(0x9<<12)
++#define STEREO_BCLK_DIV1_11			(0xA<<12)
++#define STEREO_BCLK_DIV1_12			(0xB<<12)
++#define STEREO_BCLK_DIV1_13			(0xC<<12)
++#define STEREO_BCLK_DIV1_14			(0xD<<12)
++#define STEREO_BCLK_DIV1_15			(0xE<<12)
++#define STEREO_BCLK_DIV1_16			(0xF<<12)
++
++#define STEREO_BCLK_DIV2_MASK		(0x7<<8)
++#define STEREO_BCLK_DIV2_2			(0x0<<8)
++#define STEREO_BCLK_DIV2_4			(0x1<<8)
++#define STEREO_BCLK_DIV2_8			(0x2<<8)
++#define STEREO_BCLK_DIV2_16			(0x3<<8)
++#define STEREO_BCLK_DIV2_32			(0x4<<8)
++
++#define STEREO_AD_LRCK_DIV1_MASK	(0xF<<4)
++#define STEREO_AD_LRCK_DIV1_1		(0x0<<4)
++#define STEREO_AD_LRCK_DIV1_2		(0x1<<4)
++#define STEREO_AD_LRCK_DIV1_3		(0x2<<4)
++#define STEREO_AD_LRCK_DIV1_4		(0x3<<4)
++#define STEREO_AD_LRCK_DIV1_5		(0x4<<4)
++#define STEREO_AD_LRCK_DIV1_6		(0x5<<4)
++#define STEREO_AD_LRCK_DIV1_7		(0x6<<4)
++#define STEREO_AD_LRCK_DIV1_8		(0x7<<4)
++#define STEREO_AD_LRCK_DIV1_9		(0x8<<4)
++#define STEREO_AD_LRCK_DIV1_10		(0x9<<4)
++#define STEREO_AD_LRCK_DIV1_11		(0xA<<4)
++#define STEREO_AD_LRCK_DIV1_12		(0xB<<4)
++#define STEREO_AD_LRCK_DIV1_13		(0xC<<4)
++#define STEREO_AD_LRCK_DIV1_14		(0xD<<4)
++#define STEREO_AD_LRCK_DIV1_15		(0xE<<4)
++#define STEREO_AD_LRCK_DIV1_16		(0xF<<4)
++
++#define STEREO_AD_LRCK_DIV2_MASK	(0x7<<1)
++#define STEREO_AD_LRCK_DIV2_2		(0x0<<1)
++#define STEREO_AD_LRCK_DIV2_4		(0x1<<1)
++#define STEREO_AD_LRCK_DIV2_8		(0x2<<1)
++#define STEREO_AD_LRCK_DIV2_16		(0x3<<1)
++#define STEREO_AD_LRCK_DIV2_32		(0x4<<1)
++
++#define STEREO_DA_LRCK_DIV_MASK		(1)
++#define STEREO_DA_LRCK_DIV_32		(0)
++#define STEREO_DA_LRCK_DIV_64		(1)
++
++//Stereo DAC Clock Control 2(0x62)
++#define STEREO_DA_FILTER_DIV1_MASK	(0xF<<12)
++#define STEREO_DA_FILTER_DIV1_1		(0x0<<12)
++#define STEREO_DA_FILTER_DIV1_2		(0x1<<12)
++#define STEREO_DA_FILTER_DIV1_3		(0x2<<12)
++#define STEREO_DA_FILTER_DIV1_4		(0x3<<12)
++#define STEREO_DA_FILTER_DIV1_5		(0x4<<12)
++#define STEREO_DA_FILTER_DIV1_6		(0x5<<12)
++#define STEREO_DA_FILTER_DIV1_7		(0x6<<12)
++#define STEREO_DA_FILTER_DIV1_8		(0x7<<12)
++#define STEREO_DA_FILTER_DIV1_9		(0x8<<12)
++#define STEREO_DA_FILTER_DIV1_10	(0x9<<12)
++#define STEREO_DA_FILTER_DIV1_11	(0xA<<12)
++#define STEREO_DA_FILTER_DIV1_12	(0xB<<12)
++#define STEREO_DA_FILTER_DIV1_13	(0xC<<12)
++#define STEREO_DA_FILTER_DIV1_14	(0xD<<12)
++#define STEREO_DA_FILTER_DIV1_15	(0xE<<12)
++#define STEREO_DA_FILTER_DIV1_16	(0xF<<12)
++
++#define STEREO_DA_FILTER_DIV2_MASK	(0x7<<9)
++#define STEREO_DA_FILTER_DIV2_2		(0x0<<9)
++#define STEREO_DA_FILTER_DIV2_4		(0x1<<9)
++#define STEREO_DA_FILTER_DIV2_8		(0x2<<9)
++#define STEREO_DA_FILTER_DIV2_16	(0x3<<9)
++#define STEREO_DA_FILTER_DIV2_32	(0x4<<9)
++
++#define STEREO_AD_FILTER_DIV1_MASK	(0xF<<4)
++#define STEREO_AD_FILTER_DIV1_1		(0x0<<4)
++#define STEREO_AD_FILTER_DIV1_2		(0x1<<4)
++#define STEREO_AD_FILTER_DIV1_3		(0x2<<4)
++#define STEREO_AD_FILTER_DIV1_4		(0x3<<4)
++#define STEREO_AD_FILTER_DIV1_5		(0x4<<4)
++#define STEREO_AD_FILTER_DIV1_6		(0x5<<4)
++#define STEREO_AD_FILTER_DIV1_7		(0x6<<4)
++#define STEREO_AD_FILTER_DIV1_8		(0x7<<4)
++#define STEREO_AD_FILTER_DIV1_9		(0x8<<4)
++#define STEREO_AD_FILTER_DIV1_10	(0x9<<4)
++#define STEREO_AD_FILTER_DIV1_11	(0xA<<4)
++#define STEREO_AD_FILTER_DIV1_12	(0xB<<4)
++#define STEREO_AD_FILTER_DIV1_13	(0xC<<4)
++#define STEREO_AD_FILTER_DIV1_14	(0xD<<4)
++#define STEREO_AD_FILTER_DIV1_15	(0xE<<4)
++#define STEREO_AD_FILTER_DIV1_16	(0xF<<4)
++
++#define STEREO_AD_FILTER_DIV2_MASK	(0x7<<1)
++#define STEREO_AD_FILTER_DIV2_1		(0x0<<1)
++#define STEREO_AD_FILTER_DIV2_2		(0x1<<1)
++#define STEREO_AD_FILTER_DIV2_4		(0x2<<1)
++#define STEREO_AD_FILTER_DIV2_8		(0x3<<1)
++#define STEREO_AD_FILTER_DIV2_16	(0x4<<1)
++#define STEREO_AD_FILTER_DIV2_32	(0x5<<1)
++
++
++//Voice DAC PCM Clock Control 1(0x64)
++#define VOICE_BCLK_DIV1_MASK		(0xF<<12)
++#define VOICE_BCLK_DIV1_1			(0x0<<12)
++#define VOICE_BCLK_DIV1_2			(0x1<<12)
++#define VOICE_BCLK_DIV1_3			(0x2<<12)
++#define VOICE_BCLK_DIV1_4			(0x3<<12)
++#define VOICE_BCLK_DIV1_5			(0x4<<12)
++#define VOICE_BCLK_DIV1_6			(0x5<<12)
++#define VOICE_BCLK_DIV1_7			(0x6<<12)
++#define VOICE_BCLK_DIV1_8			(0x7<<12)
++#define VOICE_BCLK_DIV1_9			(0x8<<12)
++#define VOICE_BCLK_DIV1_10			(0x9<<12)
++#define VOICE_BCLK_DIV1_11			(0xA<<12)
++#define VOICE_BCLK_DIV1_12			(0xB<<12)
++#define VOICE_BCLK_DIV1_13			(0xC<<12)
++#define VOICE_BCLK_DIV1_14			(0xD<<12)
++#define VOICE_BCLK_DIV1_15			(0xE<<12)
++#define VOICE_BCLK_DIV1_16			(0xF<<12)
++
++#define VOICE_BCLK_DIV2_MASK		(0x7<<8)
++#define VOICE_BCLK_DIV2_2			(0x0<<8)
++#define VOICE_BCLK_DIV2_4			(0x1<<8)
++#define VOICE_BCLK_DIV2_8			(0x2<<8)
++#define VOICE_BCLK_DIV2_16			(0x3<<8)
++#define VOICE_BCLK_DIV2_32			(0x4<<8)
++
++#define VOICE_AD_LRCK_DIV1_MASK	(0xF<<4)
++#define VOICE_AD_LRCK_DIV1_1		(0x0<<4)
++#define VOICE_AD_LRCK_DIV1_2		(0x1<<4)
++#define VOICE_AD_LRCK_DIV1_3		(0x2<<4)
++#define VOICE_AD_LRCK_DIV1_4		(0x3<<4)
++#define VOICE_AD_LRCK_DIV1_5		(0x4<<4)
++#define VOICE_AD_LRCK_DIV1_6		(0x5<<4)
++#define VOICE_AD_LRCK_DIV1_7		(0x6<<4)
++#define VOICE_AD_LRCK_DIV1_8		(0x7<<4)
++#define VOICE_AD_LRCK_DIV1_9		(0x8<<4)
++#define VOICE_AD_LRCK_DIV1_10		(0x9<<4)
++#define VOICE_AD_LRCK_DIV1_11		(0xA<<4)
++#define VOICE_AD_LRCK_DIV1_12		(0xB<<4)
++#define VOICE_AD_LRCK_DIV1_13		(0xC<<4)
++#define VOICE_AD_LRCK_DIV1_14		(0xD<<4)
++#define VOICE_AD_LRCK_DIV1_15		(0xE<<4)
++#define VOICE_AD_LRCK_DIV1_16		(0xF<<4)
++
++#define VOICE_AD_LRCK_DIV2_MASK	(0x7<<1)
++#define VOICE_AD_LRCK_DIV2_2		(0x0<<1)
++#define VOICE_AD_LRCK_DIV2_4		(0x1<<1)
++#define VOICE_AD_LRCK_DIV2_8		(0x2<<1)
++#define VOICE_AD_LRCK_DIV2_16		(0x3<<1)
++#define VOICE_AD_LRCK_DIV2_32		(0x4<<1)
++
++#define VOICE_DA_LRCK_DIV_MASK		(1)
++#define VOICE_DA_LRCK_DIV_32		(0)
++#define VOICE_DA_LRCK_DIV_64		(1)
++
++
++//Psedueo Stereo & Spatial Effect Block Control(0x68)
++#define SPATIAL_CTRL_EN				(0x1<<15)
++#define ALL_PASS_FILTER_EN			(0x1<<14)
++#define PSEUDO_STEREO_EN			(0x1<<13)
++#define STEREO_EXPENSION_EN			(0x1<<12)
++
++#define SPATIAL_3D_GAIN1_MASK			(0x3<<10)
++#define SPATIAL_3D_GAIN1_1_0			(0x0<<10)
++#define SPATIAL_3D_GAIN1_1_5			(0x1<<10)
++#define SPATIAL_3D_GAIN1_2_0			(0x2<<10)
++
++#define SPATIAL_3D_RATIO1_MASK			(0x3<<8)
++#define SPATIAL_3D_RATIO1_0_0			(0x0<<8)
++#define SPATIAL_3D_RATIO1_0_66			(0x1<<8)
++#define SPATIAL_3D_RATIO1_1_0			(0x2<<8)
++
++#define SPATIAL_3D_GAIN2_MASK			(0x3<<6)
++#define SPATIAL_3D_GAIN2_1_0			(0x0<<6)
++#define SPATIAL_3D_GAIN2_1_5			(0x1<<6)
++#define SPATIAL_3D_GAIN2_2_0			(0x2<<6)
++
++#define SPATIAL_3D_RATIO2_MASK			(0x3<<4)
++#define SPATIAL_3D_RATIO2_0_0			(0x0<<4)
++#define SPATIAL_3D_RATIO2_0_66			(0x1<<4)
++#define SPATIAL_3D_RATIO2_1_0			(0x2<<4)
++
++#define APF_MASK					(0x3)
++#define APF_FOR_48K					(0x3)
++#define APF_FOR_44_1K				(0x2)
++#define APF_FOR_32K					(0x1)
++
++//EQ Control and Status /ADC HPF Control(0x6E)
++#define EN_HW_EQ_BLK			(0x1<<15)		//HW EQ block control
++
++#define EQ_SOUR_SEL_DAC			(0x0<<14)
++#define EQ_SOUR_SEL_ADC			(0x1<<14)
++
++#define EQ_CHANGE_EN			(0x1<<7)		//EQ parameter update control
++#define EN_HW_EQ_HPF			(0x1<<4)		//EQ High Pass Filter Control
++#define EN_HW_EQ_BP3			(0x1<<3)		//EQ Band-3 Control
++#define EN_HW_EQ_BP2			(0x1<<2)		//EQ Band-2 Control
++#define EN_HW_EQ_BP1			(0x1<<1)		//EQ Band-1 Control
++#define EN_HW_EQ_LPF			(0x1<<0)		//EQ Low Pass Filter Control
++
++
++//AEC register command(0x74)
++
++#define VODSP_BUSY					(0x1<<15)	//VODSP I2C busy flag
++
++#define VODSP_S_FROM_VODSP_RD		(0x0<<14)
++#define VODSP_S_FROM_MX72			(0x1<<14)
++
++#define VODSP_CLK_SEL_MASK			(0x3<<12)	//VODSP CLK select Mask
++#define VODSP_CLK_SEL_12_288M		(0x0<<12)	//VODSP CLK select 12.288Mhz
++#define VODSP_CLK_SEL_6_144M		(0x1<<12)	//VODSP CLK select 6.144Mhz
++#define VODSP_CLK_SEL_3_072M		(0x2<<12)	//VODSP CLK select 3.072Mhz
++#define VODSP_CLK_SEL_2_048M		(0x3<<12)	//VODSP CLK select 2.0488Mhz
++
++#define VODSP_READ_ENABLE			(0x1<<9)	//VODSP Read Enable
++#define VODSP_WRITE_ENABLE			(0x1<<8)	//VODSP Write Enable
++
++#define VODSP_CMD_MASK				(0xFF<<0)
++#define VODSP_CMD_MW				(0x3B<<0)		//Memory Write
++#define VODSP_CMD_MR				(0x37<<0)		//Memory Read
++#define VODSP_CMD_RR				(0x60<<0)		//Register Read
++#define VODSP_CMD_RW				(0x68<<0)		//Register Write
++
++
++/*************************************************************************************************
++  *Index register of codec
++  *************************************************************************************************/
++/*Index(0x20) for Auto Volume Control*/ 
++#define	AVC_CH_SEL_MASK				(0x1<<7)
++#define AVC_CH_SEL_L_CH				(0x0<<7)
++#define AVC_CH_SEL_R_CH				(0x1<<7)
++#define ENABLE_AVC_GAIN_CTRL		(0x1<<15)
++
++
++#endif
