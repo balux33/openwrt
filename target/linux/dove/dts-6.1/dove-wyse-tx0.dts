@@ -137,6 +137,13 @@
 			reg = <0x1f>;
 			#sound-dai-cells = <0>;
 	};
+	
+	idt5v49ee503: clock-generator@6A {
+		#clock-cells = <0>;
+		compatible = "idt,idt5v49ee503";
+		reg = <0x6A>;
+		factory-fout = <50000000>;
+	};
 };
 
 &i2c1 {
@@ -179,8 +186,10 @@
 };
 
 &lcd0{
-	clocks = <&divider_clk 3>;   
-	clock-names = "plldivider";
+	//clocks = <&divider_clk 3>;   
+	//clock-names = "plldivider";
+	clocks = <&idt5v49ee503 0>;
+	clock-names = "ext_ref_clk1";  //connected to pll out 2
 	status = "okay";
 	
 	lcd0_port: port 
